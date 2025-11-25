@@ -1,0 +1,175 @@
+clear; close all; clc;
+
+rng(0);                    % fixed seed for reproducibility (remove for random runs)
+numFrames = 2000;          % number of independent frames 
+dataBitsPerFrame = 1024;   % number of information bits per frame
+SNR_dB = 0:2:20;           % SNR range in dB (Eb/No style here: we'll interpret as Es/No)
+
+% Long Training Sequence (LTS) and repeated TS (ts)
+lts = [1, 1, -1, -1, 1, 1, -1, 1, -1, 1, 1, 1, 1, 1, 1, ...
+    -1, -1, 1, 1, -1, 1, -1, 1, 1, 1, 1, 0, 1, -1, -1, 1, 1, -1, 1, -1, ...
+    1, -1, -1, -1, -1, -1, 1, 1, -1, -1, 1, -1, 1, -1, 1, 1, 1, 1];
+
+ts = [lts lts];            % pilot symbols (length Np)
+txPilot = ts(:).';         % row vector
+Np = length(ts);           % length of pilot symbols
+
+const = [1+1j 1-1j -1+1j -1-1j]/sqrt(2);    % normalized QPSK
+bitMapping = [0 0; 0 1; 1 0; 1 1];             % Gray mapping 
+
+
+BER = zeros(size(SNR_dB));  % BER for each SNR defined initially zeros values
+theory_awgn_qpsk = 0.5*erfc( sqrt(10.^(SNR_dB/10)) ); % reference AWGN QPSK (Es/No)
+
+
+for si = 1:length(SNR_dB)
+    snrdB = SNR_dB(si);
+    snrLinar = 10^(snrdB/10);   % Es/No linear
+    errors = 0;
+    totalBits = 0;
+    % For each frame:
+    for frame = 1:numFrames
+        % 1) Generate random data bits for this frame
+        dataBits = randi([0 1], 1, dataBitsPerFrame);
+        
+        lenDataBits = length(dataBits);
+        % Make sure bit-length is even (for QPSK)
+        if mod(lenDataBits,2)~=0
+            dataBits = dataBits(1:lenDataBits-1);
+        end
+        totalBits = totalBits + length(dataBits);
+        % 2) Map bits to QPSK symbols
+        dataSymbols = bits2symbols(dataBits);
+
+        % 3) Build transmit vector: [pilot, data]
+        % Pilot are BPSK-like real values; cast to complex for channel
+        txPilot = txPilot + 0j; % convert to complex
+        txSymbols = [txPilot, dataSymbols];    % packet: pilot first then data
+
+        % 4) Channel: flat Rayleigh fading (complex scalar) per frame
+        % Rayleigh complex channel: h ~ (randn + 1j*randn)/sqrt(2)
+        h = (randn + 1j*randn)/sqrt(2);
+
+        % 5) Pass through channel and add AWGN
+        % Compute noise power per symbol: Es/N0 = snr_lin ; Es = 1 -> noise variance = 1/snr_lin
+        Es = 1; % average symbol energy
+        noiseVar = Es / snrLinar;             % total noise variance (per complex symbol)
+        noiseSigma = sqrt(noiseVar/2);       % per real component (complex AWGN)
+        noise = noiseSigma*(randn(1, length(txSymbols)) + 1j*randn(1, length(txSymbols)));
+        
+        rxSymbols = h * txSymbols + noise;   % received symbols
+        
+        % 6) Channel estimation using LSE with pilots
+        % LSE for scalar: h_est = (p^H p)^{-1} p^H r_pilot
+        rp = rxSymbols(1:Np);            % received pilot region
+        p = txPilot;                     % transmitted pilot symbols
+        % If there are zero pilot entries (like your 0), they won't contribute to denominator.
+        denom = sum(abs(p).^2);
+        if denom == 0
+            % Avoid division by zero: fallback to simple estimate using average
+            h_est = sum(conj(p).*rp) / (sum(abs(p)>0) + eps);
+        else
+            h_est = sum(conj(p).*rp) / denom;
+        end
+
+        % 7) Equalize data: simple zero-forcing per-frame scalar division
+        rdata = rxSymbols(Np+1:end);
+        eqData = rdata ./ h_est;      % element wise division
+        
+        % 8) Symbol decision: nearest QPSK constellation
+        % Make vectorized nearest neighbor detection
+        detectedSymbols = qpskNearestPoint(eqData);
+        
+        % 9) Bits from detected symbols
+        detectedBits = symbols2bits(detectedSymbols);
+
+        % 10) Count bit errors
+        % Note: we must ensure we compare the right number of bits
+        bitsToCompare = dataBits(1:length(detectedBits));
+        errors = errors + sum(bitsToCompare ~= detectedBits);
+
+    end
+    BER(si) = errors / totalBits;
+    fprintf('SNR = %2d dB: BER = %.5e (errors=%d, bits=%d)\n', snrdB, BER(si), errors, totalBits);
+
+end
+
+%% -------------------- Plot results --------------------
+figure;
+semilogy(SNR_dB, BER, '-o', 'LineWidth', 1.6, 'MarkerSize',6); hold on;
+semilogy(SNR_dB, theory_awgn_qpsk, '--', 'LineWidth', 1.2);
+grid on;
+xlabel('SNR (dB) — E_s/N_0'); ylabel('Bit Error Rate (BER)');
+title('BER vs SNR for QPSK with LTS-based LSE under Rayleigh fading + AWGN');
+legend('Simulated (LSE pilot-based)', 'Theoretical AWGN QPSK (no fading)');
+ylim([1e-5 1]);
+set(gca, 'YScale', 'log');
+
+%% -------------------- functions --------------------
+
+function symbols = bits2symbols(bits)
+
+    % Ensure length is even
+    if mod(length(bits), 2) ~= 0
+        bits = bits(1:end-1);
+    end
+
+    % Pre-allocate row vector
+    symbols = zeros(1, length(bits)/2);
+
+    % Map bits to QPSK symbols
+    for k = 1:2:length(bits)
+        realPart = 1 - 2 * bits(k);
+        imagPart = 1 - 2 * bits(k+1);
+        symbols((k+1)/2) = (realPart + 1i * imagPart) / sqrt(2);
+    end
+end
+
+% qpskNearestPoint:
+% Takes noisy QPSK symbols and maps them
+% to the nearest constellation point using formulas.
+function decided = qpskNearestPoint(rxSymbols)
+    % qpskNearestPoint:
+    % Takes noisy QPSK symbols and maps them
+    % to the nearest constellation point using formulas.
+
+    % Pre-allocate output (same size as input)
+    decided = zeros(size(rxSymbols));
+
+    for k = 1:length(rxSymbols)
+        sym = rxSymbols(k);
+
+        % Decide real part: +1 or -1
+        realPart = 1;
+        if real(sym) < 0
+            realPart = -1;
+        end
+
+        % Decide imag part: +1 or -1
+        imagPart = 1;
+        if imag(sym) < 0
+            imagPart = -1;
+        end
+
+        % Construct the normalized QPSK symbol
+        decided(k) = (realPart + 1i * imagPart) / sqrt(2);
+    end
+end
+
+% symbols2bits:
+% Converts QPSK symbols back to bits using inverse mapping
+function bits = symbols2bits(symbols)
+
+    N = length(symbols);
+    bits = zeros(1, 2 * N);
+
+    for k = 1:N
+        sym = symbols(k);
+
+        % First bit from real part
+        bits(2*k - 1) = (1 - sign(real(sym))) / 2;
+
+        % Second bit from imaginary part
+        bits(2*k) = (1 - sign(imag(sym))) / 2;
+    end
+end
